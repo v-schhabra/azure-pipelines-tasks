@@ -1,5 +1,5 @@
 parameters:
-- name: serviceConnection
+- name: Service Connection
   displayName: Override Service Connection
   type: string
   default: '<from subscriptionConnection variable>'
@@ -30,7 +30,7 @@ steps:
   displayName: 'AzureCLI $(serviceConnection)'
   inputs:
     addSpnToEnvironment: true
-    azureSubscription: '$(serviceConnection)' # Task property referencing Service Connection -------------------------------------------------------
+    azureSubscription: janARM # Task property referencing Service Connection -------------------------------------------------------
     scriptType: pscore
     scriptLocation: inlineScript
     inlineScript: |
@@ -104,7 +104,7 @@ steps:
 - task: AzurePowerShell@5
   displayName: 'AzurePowerShell $(serviceConnection)'
   inputs:
-    azureSubscription: '$(serviceConnection)'
+    azureSubscription: janARM
     scriptType: inlineScript
     inline: |
       Get-AzContext Format-List
