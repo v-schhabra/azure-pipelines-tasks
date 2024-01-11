@@ -1,133 +1,120 @@
-trigger:
-- master
-- releases/*
-- node6hotfixes/*
+parameters:
+- name: serviceConnection
+  displayName: Override Service Connection
+  type: string
+  default: '<from subscriptionConnection variable>'
+- name: jobType
+  displayName: Job type
+  type: string
+  default: agentJob
+  values:
+  - agentJob
+  - containerJob
+  - deploymentJob
+  - environmentVM
+- name: poolName
+  displayName: Agent Pool
+  type: string
+  default: 'Azure Pipelines'
+- name: vmImage
+  displayName: Agent Pool
+  type: string
+  default: 'ubuntu-latest'
+- name: environmentName
+  displayName: Environment
+  type: string
+  default: 'scratch'
 
-resources:
-  repositories:
-  - repository: AzureDevOps
-    type: git
-    endpoint: AzureDevOps
-    name: AzureDevOps/AzureDevOps
+steps:
+- task: AzureCLI@2
+  displayName: 'AzureCLI $(serviceConnection)'
+  inputs:
+    addSpnToEnvironment: true
+    azureSubscription: '$(serviceConnection)' # Task property referencing Service Connection -------------------------------------------------------
+    scriptType: pscore
+    scriptLocation: inlineScript
+    inlineScript: |
+      Write-Host "`n$($PSStyle.Bold)Service Connection name: '$(serviceConnection)'$($PSStyle.Reset) -----------------------------------------------"
 
-jobs:
+      Get-ChildItem -Path Env: -Recurse -Include ENDPOINT_DATA_* | Sort-Object -Property Name `
+                                                                 | Select-Object -First 1 -ExpandProperty Name `
+                                                                 | ForEach-Object { $_ -replace 'ENDPOINT_DATA_','' } `
+                                                                 | Set-Variable serviceConnectionId
+      Write-Host "Service Connection ID: ${serviceConnectionId}"
 
-# All tasks on Windows
-- job: build_all_windows
-  displayName: Build all tasks (Windows)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Windows_NT'))
-  pool:
-    vmImage: vs2017-win2016
-  timeoutInMinutes: 120
-  steps:
-  - template: ci/build-all-steps.yml
-    parameters:
-      os: Windows_NT
+      Write-Host "`nVariables added by 'addSpnToEnvironment':" -NoNewline
+      Get-ChildItem -Path Env: -Recurse -Include idToken, `
+                                                servicePrincipalId, `
+                                                servicePrincipalKey,`
+                                                tenantId `
+                    | Sort-Object -Property Name `
+                    | Select-Object -Property Name `
+                    | Format-Table -HideTableHeaders
+      if ($env:servicePrincipalKey) {
+        Write-Host "Using Service Principal secret for authentication"
+      } elseif ($env:idToken) {
+        Write-Host "Using Workload Identity federation (OIDC) for authentication"
+      }
 
-# Publish on Windows
-- job: publish_windows
-  displayName: Publish
-  dependsOn:
-  - build_all_windows
-  condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), eq(variables.os, 'Windows_NT'))
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - template: ci/publish-steps.yml
+      Write-Host "`n$($PSStyle.Formatting.FormatAccent)az account show$($PSStyle.Reset)"
+      az account show -o json `
+                      | Tee-Object -FilePath subscription.json `
+                      | ConvertFrom-Json `
+                      | Set-Variable subscription
+      Get-Content subscription.json
+      $appId = $subscription.user.name
 
-# Courtesy push on Windows
-- job: courtesy_push_windows
-  displayName: Courtesy Push
-  dependsOn:
-  - publish_windows
-  condition: and(succeeded(), in(variables['build.reason'], 'Schedule', 'Manual'), eq(variables['COURTESY_PUSH'], 'true'))
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - powershell: |
-      $week = (Invoke-WebRequest https://whatsprintis.it -Headers @{"Accept"= "application/json"} | ConvertFrom-Json).week
-      Write-Host "##vso[task.setvariable variable=week]$week"
-    displayName: "Determine if its the last week of the sprint"
-  - checkout: AzureDevOps
-    fetchDepth: 1
-    persistCredentials: true
-    condition: and(succeeded(), or(eq(variables['WEEK'], '3'), eq(variables['FORCE_COURTESY_PUSH'], 'true')))
-  - checkout: self
-    condition: and(succeeded(), or(eq(variables['WEEK'], '3'), eq(variables['FORCE_COURTESY_PUSH'], 'true')))
-  - template: ci/courtesy-push.yml
+      Write-Host "`n$($PSStyle.Bold)Service Connection role assignments:$($PSStyle.Reset) ---------------------------------------------------------------"
+      Write-Host "$($PSStyle.Formatting.FormatAccent)az role assignment list --assignee <appId>$($PSStyle.Reset)"
+      az role assignment list --all `
+                              --assignee $appId `
+                              -o json `
+                              | Tee-Object -FilePath roleAssignments.json `
+                              | ConvertFrom-Json `
+                              | Select-Object -Property roleDefinitionName, scope `
+                              | Sort-Object -Property roleDefinitionName
+                              | Format-Table -AutoSize -Wrap
 
-# Send notifications by POST method to MS Teams webhook
-# Body of message is compiled as Office 365 connector card
-# More details about cards - https://docs.microsoft.com/en-us/microsoftteams/platform/task-modules-and-cards/cards/cards-reference#office-365-connector-card
-- job: notify_courtesy_push_fail
-  displayName: Notify courtesy push fail
-  dependsOn:
-  - courtesy_push_windows
-  condition: |
-    and
-    (
-      in(dependencies.courtesy_push_windows.result, 'Failed', 'Skipped'),
-      eq(variables['COURTESY_PUSH'], 'true'),
-      eq(variables['build.reason'], 'Schedule'),
-      eq(variables['COURTESY_PUSH_NOTIFICATION'], 'true')
-    )
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - powershell: .\ci\courtesy-push\send-notification.ps1 -IsPRCreated $false
-    displayName: 'Send notification to the MS Teams channel'
-    env:
-      TEAMS_WEBHOOK: $(MSTeamsUri)
+      Write-Host "`n$($PSStyle.Bold)Service Connection Service Principal object:$($PSStyle.Reset) -------------------------------------------------------"
+      Write-Host "$($PSStyle.Formatting.FormatAccent)az ad sp show --id <appId>$($PSStyle.Reset)"
+      az ad sp show --id $appId `
+                    -o json `
+                    | Tee-Object -FilePath servicePrincipal.json `
+                    | ConvertFrom-Json `
+                    | Set-Variable servicePrincipal
+      Get-Content servicePrincipal.json
+      if ($servicePrincipal.servicePrincipalType -eq 'ManagedIdentity') {
+        "https://portal.azure.com/#@{0}/resource{1}" -f $subscription.tenantId, $servicePrincipal.alternativeNames[1] | Set-Variable azurePortalLink
+      } else {
+        "https://portal.azure.com/{0}/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/Overview/appId/{1}/isMSAApp/" -f $subscription.tenantId, $appId | Set-Variable azurePortalLink
+      }
+      Write-Host "`nAzure Portal link for Service Principal of type '$($servicePrincipal.servicePrincipalType)':`n$($azurePortalLink)"
 
-# All tasks on Linux
-- job: build_all_linux
-  displayName: Build all tasks (Linux)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Linux'))
-  pool:
-    vmImage: ubuntu-18.04
-  steps:
-  - template: ci/build-all-steps.yml
-    parameters:
-      os: Linux
+      Write-Host "`n$($PSStyle.Bold)Subscriptions the Service Connection has access to:$($PSStyle.Reset) ------------------------------------------------"
+      Write-Host "$($PSStyle.Formatting.FormatAccent)az account list$($PSStyle.Reset)"
+      az account list --query "sort_by([].{Name:name, SubscriptionId:id}, &Name)" `
+                      -o table
+      
+      Write-Host "`n$($PSStyle.Bold)Resource groups that the Service Connection has access to in subscription '$(az account show --query name -o tsv)':$($PSStyle.Reset) -------------"
+      Write-Host "$($PSStyle.Formatting.FormatAccent)az group list$($PSStyle.Reset)"
+      az group list --query "sort_by([].{Name:name, ResourceId:id}, &Name)" `
+                    -o table
+    workingDirectory: '$(Build.ArtifactStagingDirectory)'
 
-# All tasks on macOS
-- job: build_all_darwin
-  displayName: Build all tasks (macOS)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Darwin'))
-  pool:
-    vmImage: macos-10.15
-  steps:
-  - template: ci/build-all-steps.yml
-    parameters:
-      os: Darwin
+- task: AzurePowerShell@5
+  displayName: 'AzurePowerShell $(serviceConnection)'
+  inputs:
+    azureSubscription: '$(serviceConnection)'
+    scriptType: inlineScript
+    inline: |
+      Get-AzContext Format-List
+      Get-AzContext | Select-Object -ExpandProperty Subscription | Format-List
 
-# Single task
-- job: buildSingle
-  displayName: Build single task
-  condition: and(succeeded(), variables.task)
-  steps:
-  - template: ci/build-single-steps.yml
+    azurePowerShellVersion: 'latestVersion'
+    pwsh: true
+    failOnStandardError: true
 
-- job: buildSharedNpm_win
-  displayName: Build shared npm packages (Win)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Windows_NT'))
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - template: ci/build-common-npm.yml
-
-- job: buildSharedNpm_linux
-  displayName: Build shared npm packages (Linux)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Linux'))
-  pool:
-    vmImage: ubuntu-18.04
-  steps:
-  - template: ci/build-common-npm.yml
-
-- job: buildSharedNpm_darwin
-  displayName: Build shared npm packages (macOS)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Darwin'))
-  pool:
-    vmImage: macos-10.15
-  steps:
-  - template: ci/build-common-npm.yml
+- pwsh: |
+    Install-Module -Name Az -Repository PSGallery -Force
+    Import-Module Az
+    Get-AzContext
